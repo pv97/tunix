@@ -888,6 +888,87 @@ class VllmSamplerTest(absltest.TestCase):
     with self.assertRaises(ValueError):
       vllm_sampler.VllmSampler(server_id="bad_mode", config=invalid_cfg)
 
+  def test_raiden_random_init_defaults_load_format_to_dummy(self):
+    raiden_dummy = vllm_sampler.VllmSampler(
+        server_id="raiden_dummy",
+        config=_config(
+            weight_sync_mode="raiden",
+            rollout_vllm_init_with_random_weights=True,
+        ),
+    )
+    self.assertEqual(raiden_dummy._engine_kwargs.get("load_format"), "dummy")
+
+    explicit = vllm_sampler.VllmSampler(
+        server_id="raiden_explicit",
+        config=_config(
+            weight_sync_mode="raiden",
+            rollout_vllm_init_with_random_weights=True,
+            rollout_vllm_kwargs={"load_format": "safetensors"},
+        ),
+    )
+    self.assertEqual(explicit._engine_kwargs.get("load_format"), "safetensors")
+
+    non_raiden = vllm_sampler.VllmSampler(
+        server_id="non_raiden_random",
+        config=_config(
+            weight_sync_mode="none",
+            rollout_vllm_init_with_random_weights=True,
+        ),
+    )
+    self.assertNotIn("load_format", non_raiden._engine_kwargs)
+
+    no_random_init = vllm_sampler.VllmSampler(
+        server_id="raiden_no_random",
+        config=_config(
+            weight_sync_mode="raiden",
+            rollout_vllm_init_with_random_weights=False,
+        ),
+    )
+    self.assertNotIn("load_format", no_random_init._engine_kwargs)
+
+  def test_call_worker_method_flattens_multi_dp_core_engines(self):
+    sampler = vllm_sampler.VllmSampler(
+        server_id="multi_dp",
+        config=_config(weight_sync_mode="raiden"),
+    )
+    call_utility_all_async = mock.AsyncMock(
+        return_value=[[{"rank": 0}, {"rank": 1}], [{"rank": 2}, {"rank": 3}]]
+    )
+    collective_rpc = mock.AsyncMock(return_value=[{"rank": 0}, {"rank": 1}])
+    sampler._engine = SimpleNamespace(
+        engine_core=SimpleNamespace(
+            core_engines=["e0", "e1"],
+            call_utility_all_async=call_utility_all_async,
+        ),
+        collective_rpc=collective_rpc,
+    )
+    res = asyncio.run(sampler._call_worker_method("raiden_h2d", uuid=7))
+    self.assertEqual(
+        res, [{"rank": 0}, {"rank": 1}, {"rank": 2}, {"rank": 3}]
+    )
+    call_utility_all_async.assert_awaited_once_with(
+        "collective_rpc", "raiden_h2d", None, (), {"uuid": 7}
+    )
+    collective_rpc.assert_not_awaited()
+
+    single_dp_call_utility = mock.AsyncMock()
+    single_dp_collective_rpc = mock.AsyncMock(
+        return_value=[{"rank": 0}, {"rank": 1}]
+    )
+    sampler._engine = SimpleNamespace(
+        engine_core=SimpleNamespace(
+            core_engines=["e0"],
+            call_utility_all_async=single_dp_call_utility,
+        ),
+        collective_rpc=single_dp_collective_rpc,
+    )
+    single_res = asyncio.run(sampler._call_worker_method("raiden_h2d", uuid=7))
+    self.assertEqual(single_res, [{"rank": 0}, {"rank": 1}])
+    single_dp_call_utility.assert_not_awaited()
+    single_dp_collective_rpc.assert_awaited_once_with(
+        "raiden_h2d", args=(), kwargs={"uuid": 7}
+    )
+
 
 class RoundUuidTest(absltest.TestCase):
   """Covers the extra_config -> Raiden transfer generation extraction."""

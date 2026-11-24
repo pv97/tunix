@@ -361,10 +361,11 @@ class RolloutWorker(abstract_worker.Worker):
         inflight=len(self.manager._active_tasks),  # pylint: disable=protected-access
     )
 
-  def get_target_state(self) -> Any:
+  async def get_target_state(self) -> Any:
     """Returns rollout-side target-state skeleton for trainer-side conversion."""
     self._ensure_initialized()
-    return self.manager.get_target_state()
+    res = self.manager.get_target_state()
+    return await res if inspect.isawaitable(res) else res
 
   def _stamp_worker_lineage(
       self,

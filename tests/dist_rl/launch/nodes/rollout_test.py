@@ -816,7 +816,8 @@ class EngineKwargsTest(absltest.TestCase):
   def test_forbidden_keys_cover_node_built_engine_kwargs(self):
     # Drift guard: every `AsyncEngineArgs` key `_create_vllm_sampler` builds
     # from other config fields (except `additional_config`, which is
-    # deep-merged) must stay in `_FORBIDDEN_ROLLOUT_KWARGS`.
+    # deep-merged, and `load_format`, which is an overridable default) must stay
+    # in `_FORBIDDEN_ROLLOUT_KWARGS`.
     maximal_argv = (
         "rollout_engine=vllm",
         *_ROUTED_EXPERTS_ARGV,
@@ -832,7 +833,7 @@ class EngineKwargsTest(absltest.TestCase):
     )
     kwargs = _vllm_engine_kwargs(*maximal_argv)
     self.assertLessEqual(
-        set(kwargs) - {"additional_config"},
+        set(kwargs) - {"additional_config", "load_format"},
         rollout._FORBIDDEN_ROLLOUT_KWARGS,
     )
     mt_built = rollout._maxtext_additional_config(_hp(*maximal_argv))

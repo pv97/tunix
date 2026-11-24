@@ -141,9 +141,11 @@ class VllmSampler(Sampler, weight_sync.WeightSyncDestination):
         `rollout_vllm_async_scheduling`, `rollout_vllm_max_num_seqs`,
         `rollout_vllm_max_num_batched_tokens`, `rollout_vllm_logprobs_mode`,
         `return_routed_experts` and `rollout_vllm_additional_config` fields,
-        then `rollout_vllm_kwargs`. `sample()` reads the sampling settings from
-        it and `rollout_vllm_sampling_kwargs`. Its other `rollout_vllm_*` fields
-        are not used.
+        then `rollout_vllm_kwargs`, with `load_format` defaulting to `"dummy"`
+        when `rollout_vllm_init_with_random_weights` is True under Raiden
+        (`weight_sync_mode="raiden"`). `sample()` reads the sampling settings
+        from it and `rollout_vllm_sampling_kwargs`. Its other `rollout_vllm_*`
+        fields are not used.
       worker_index: Host index within this replica.
       parallelism: Number of hosts in this replica.
     """
@@ -198,6 +200,12 @@ class VllmSampler(Sampler, weight_sync.WeightSyncDestination):
       engine_kwargs["additional_config"] = additional_config
     # Applied last, so these override the values above.
     engine_kwargs.update(extra_kwargs)
+    if (
+        config.rollout_vllm_init_with_random_weights
+        and weight_sync.WeightSyncMode(config.weight_sync_mode)
+        == weight_sync.WeightSyncMode.RAIDEN
+    ):
+      engine_kwargs.setdefault("load_format", "dummy")
     tp_size = engine_kwargs["tensor_parallel_size"]
     dp_size = engine_kwargs["data_parallel_size"]
     if tp_size < 1 or dp_size < 1:
@@ -787,11 +795,26 @@ class VllmSampler(Sampler, weight_sync.WeightSyncDestination):
   ) -> list[Any]:
     """Dispatches a method call across TPU workers via collective_rpc.
 
-    `AsyncLLMEngine` (an alias of `vllm.v1.engine.async_llm.AsyncLLM`)
-    always exposes an async `collective_rpc`.
+    When `AsyncLLMEngine` wraps a multi-DP `DPLBAsyncMPClient`
+    (`len(engine_core.core_engines) > 1`), upstream `collective_rpc_async`
+    returns only DP engine 0's worker replies. Routing through
+    `call_utility_all_async` collects and flattens replies across all DP
+    engines so every rank participates in Raiden metadata and H2D barriers.
     """
     if self._engine is None:
       return []
+    engine_client = getattr(self._engine, "engine_core", None)
+    core_engines = getattr(engine_client, "core_engines", None)
+    if (
+        engine_client is not None
+        and isinstance(core_engines, (list, tuple))
+        and len(core_engines) > 1
+        and hasattr(engine_client, "call_utility_all_async")
+    ):
+      per_engine = await engine_client.call_utility_all_async(
+          "collective_rpc", method_name, None, args, kwargs or None
+      )
+      return [res for engine_res in per_engine for res in engine_res]
     return await self._engine.collective_rpc(
         method_name, args=args, kwargs=kwargs
     )
@@ -1041,9 +1064,20 @@ class VllmSampler(Sampler, weight_sync.WeightSyncDestination):
     del kwargs
     return self._transfer_statuses.get(str(req_id), "MISSING")
 
-  def get_target_state(self) -> Any:
-    """Returns target state shape/dtype pytree for weight conversion."""
-    return None
+  async def get_target_state(self) -> Any:
+    """Returns serialized ``weight_mapping`` JSON manifest if supported by workers."""
+    if not self.enable_raiden:
+      return None
+    await self._ensure_started()
+    try:
+      replies = await self._call_worker_method("get_weight_mapping_manifest")
+      return replies[0] if replies else None
+    except Exception as exc:  # pylint: disable=broad-except
+      if "get_weight_mapping_manifest" in str(exc) or isinstance(
+          exc, (AttributeError, NotImplementedError)
+      ):
+        return None
+      raise
 
   async def get_load_info(self, **kwargs: Any) -> base_sampler_lib.LoadInfo:
     """Returns current load info (num_requests_waiting, num_requests_running, kv_cache_usage_perc)."""
